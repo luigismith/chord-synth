@@ -1,6 +1,7 @@
+
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { KnobState, Preset, PadState, Chord, SynthEngine } from './types';
-import { INITIAL_KNOBS, PRESETS, MIDI_KNOB_CC_MAP, KEYS, SCALES, ENGINES, MIDI_TRANSPORT_CC, PADS } from './constants';
+import { INITIAL_KNOBS, PRESETS, MIDI_KNOB_CC_MAP, KEYS, SCALES, ENGINES, MIDI_TRANSPORT_CC, PADS, MIDI_PAD_NOTE_MAP, MIDI_DIRECT_PARAM_CC_MAP } from './constants';
 import ControlPanel from './components/ControlPanel';
 import PadBank from './components/PadBank';
 import VisualizerCanvas from './components/VisualizerCanvas';
@@ -11,6 +12,7 @@ import { generateChordProgression } from './services/geminiService';
 import CustomSelect from './components/CustomSelect';
 import GlobalControls from './components/GlobalControls';
 import HarmonyGenerator from './components/HarmonyGenerator';
+import EnvelopePanel from './components/EnvelopePanel';
 
 const USER_PRESETS_STORAGE_KEY = 'orchid_synth_user_presets';
 
@@ -32,6 +34,13 @@ const App: React.FC = () => {
   const [arpPattern, setArpPattern] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [activeTransport, setActiveTransport] = useState<string | null>(null);
+  const [activeHarmonyPads, setActiveHarmonyPads] = useState<number[]>([]);
+
+  // MIDI Clock Sync State
+  const [isMidiClockSynced, setIsMidiClockSynced] = useState(false);
+  const [externalBpm, setExternalBpm] = useState<number | null>(null);
+  const [lastBeatTimestamp, setLastBeatTimestamp] = useState<number>(0);
+  const [lastOffBeatTimestamp, setLastOffBeatTimestamp] = useState<number>(0);
 
   // Preset Management State
   const [userPresets, setUserPresets] = useState<Preset[]>([]);
@@ -40,7 +49,7 @@ const App: React.FC = () => {
   const [morphAmount, setMorphAmount] = useState(0);
 
 
-  // Instantiate the MidiService once and store it in a ref.
+  // Refs
   const midiServiceRef = useRef<MidiService>(new MidiService());
   const heldKeys = useRef<Set<number>>(new Set());
   const arpTimeoutId = useRef<number | null>(null);
@@ -48,6 +57,9 @@ const App: React.FC = () => {
   const arpStep = useRef(0);
   const lastArpNote = useRef<number | null>(null);
   const activeChordNotes = useRef<number[]>([]);
+  const clockTickCount = useRef(0);
+  const bpmTimestamps = useRef<number[]>([]);
+
 
   const handleKnobChange = useCallback((id: number, value: number) => {
     setKnobs((prevKnobs) =>
@@ -56,129 +68,324 @@ const App: React.FC = () => {
   }, []);
 
   const stopArp = useCallback(() => {
+    // Clear internal timer if it's running
     if (arpTimeoutId.current) clearTimeout(arpTimeoutId.current);
     arpTimeoutId.current = null;
 
+    // Stop any currently sounding arp notes
     const notesToStop = new Set<number>(sustainedNoteTimeouts.current.keys());
     if (lastArpNote.current !== null) {
         notesToStop.add(lastArpNote.current);
     }
+    notesToStop.forEach(note => audioService.stopNote(note));
     
-    notesToStop.forEach(note => {
-        audioService.stopNote(note);
-    });
-    
-    sustainedNoteTimeouts.current.forEach(timeoutId => {
-        clearTimeout(timeoutId);
-    });
+    // Clear pending note-off events
+    sustainedNoteTimeouts.current.forEach(timeoutId => clearTimeout(timeoutId));
     sustainedNoteTimeouts.current.clear();
 
     lastArpNote.current = null;
     arpStep.current = 0;
   }, []);
+    
+  // Maps Arp Density knob (0-100) to standard MIDI clock divisions
+  const getArpDivider = (density: number): number => {
+    // 24 ticks = quarter note
+    if (density < 17) return 24; // 1/4 note
+    if (density < 34) return 12; // 1/8 note
+    if (density < 50) return 8;  // 1/8 note triplet
+    if (density < 67) return 6;  // 1/16 note
+    if (density < 84) return 4;  // 1/16 note triplet
+    return 3;                    // 1/32 note
+  };
+
+  const arpStepForward = useCallback(() => {
+      const notes = Array.from(heldKeys.current).sort((a, b) => a - b);
+      if (notes.length === 0) return;
+
+      let noteToPlay: number | null = null;
+      const currentStep = arpStep.current % notes.length;
+
+      switch (arpPattern) {
+        case 'down': noteToPlay = notes[notes.length - 1 - currentStep]; break;
+        case 'random': noteToPlay = notes[Math.floor(Math.random() * notes.length)]; break;
+        default: noteToPlay = notes[currentStep]; break;
+      }
+      const noteToStop = lastArpNote.current;
+      if (noteToPlay !== null) {
+        const timbreValue = knobs.find(k => k.id === 7)?.value ?? 0;
+        audioService.playNote(noteToPlay, timbreValue);
+        lastArpNote.current = noteToPlay;
+      }
+
+      if (noteToStop !== null && noteToStop !== noteToPlay) {
+        if (sustainedNoteTimeouts.current.has(noteToStop)) {
+            clearTimeout(sustainedNoteTimeouts.current.get(noteToStop)!);
+        }
+        
+        const releaseKnob = knobs.find(k => k.id === 13)?.value ?? 30; // Use Release knob for gate length
+        const sustainRatio = 0.1 + (releaseKnob / 100) * 0.9; // Map 0-100 to 10%-100% gate length
+
+        let stopDelay: number;
+
+        if (isMidiClockSynced && bpmTimestamps.current.length > 2) {
+            const first = bpmTimestamps.current[0];
+            const last = bpmTimestamps.current[bpmTimestamps.current.length - 1];
+            const ticks = bpmTimestamps.current.length - 1;
+            const avgMsPerTick = (last - first) / ticks;
+            
+            const densityKnob = knobs.find(k => k.id === 2)?.value ?? 50;
+            const arpDivider = getArpDivider(densityKnob);
+            const stepDurationMs = avgMsPerTick * arpDivider;
+            
+            stopDelay = stepDurationMs * sustainRatio;
+        } else {
+            const densityKnob = knobs.find(k => k.id === 2)?.value ?? 50;
+            const baseInterval = 600 - (densityKnob * 5.5);
+            stopDelay = baseInterval * sustainRatio;
+        }
+
+        const timeoutId = window.setTimeout(() => {
+          audioService.stopNote(noteToStop);
+          sustainedNoteTimeouts.current.delete(noteToStop);
+        }, Math.max(10, stopDelay));
+        sustainedNoteTimeouts.current.set(noteToStop, timeoutId);
+      }
+      arpStep.current++;
+  }, [knobs, arpPattern, isMidiClockSynced]);
   
   const arpTick = useCallback(() => {
-    if (!arpIsActive || heldKeys.current.size === 0) {
+    if (!arpIsActive || heldKeys.current.size === 0 || isMidiClockSynced) {
       stopArp();
       return;
     }
-    const notes = Array.from(heldKeys.current).sort((a, b) => a - b);
-    if (notes.length === 0) {
-      stopArp();
-      return;
-    }
-
-    let noteToPlay: number | null = null;
-    const currentStep = arpStep.current % notes.length;
-
-    switch (arpPattern) {
-      case 'down': noteToPlay = notes[notes.length - 1 - currentStep]; break;
-      case 'random': noteToPlay = notes[Math.floor(Math.random() * notes.length)]; break;
-      default: noteToPlay = notes[currentStep]; break;
-    }
-    const noteToStop = lastArpNote.current;
-    if (noteToPlay !== null) {
-      const timbreValue = knobs.find(k => k.id === 7)?.value ?? 0;
-      audioService.playNote(noteToPlay, timbreValue);
-      lastArpNote.current = noteToPlay;
-    }
+    
+    arpStepForward();
+    
     const density = knobs.find(k => k.id === 2)?.value ?? 50;
     const baseInterval = 600 - (density * 5.5);
-    if (noteToStop !== null && noteToStop !== noteToPlay) {
-      if (sustainedNoteTimeouts.current.has(noteToStop)) {
-          clearTimeout(sustainedNoteTimeouts.current.get(noteToStop)!);
-      }
-      const complexity = knobs.find(k => k.id === 1)?.value ?? 30;
-      const complexityFactor = complexity / 100;
-      const sustainRatio = 0.25 + Math.pow(complexityFactor, 1.5) * 2.25;
-      const stopDelay = baseInterval * sustainRatio;
-
-      const timeoutId = window.setTimeout(() => {
-        audioService.stopNote(noteToStop);
-        sustainedNoteTimeouts.current.delete(noteToStop);
-      }, Math.max(10, stopDelay));
-      sustainedNoteTimeouts.current.set(noteToStop, timeoutId);
-    }
-    arpStep.current++;
     const swing = knobs.find(k => k.id === 3)?.value ?? 0;
     let nextInterval = baseInterval;
     const swingAmount = (swing / 100) * 0.66;
     if (arpStep.current % 2 !== 0) nextInterval = baseInterval * (1 + swingAmount);
     else nextInterval = baseInterval * (1 - swingAmount);
     arpTimeoutId.current = window.setTimeout(arpTick, Math.max(50, nextInterval));
-  }, [knobs, arpIsActive, arpPattern, stopArp]);
+  }, [knobs, arpIsActive, stopArp, arpStepForward, isMidiClockSynced]);
 
   const startArp = useCallback(() => {
     stopArp();
+    if (isMidiClockSynced) return; // Don't start internal timer if synced
     arpStep.current = 0;
     arpTick();
-  }, [stopArp, arpTick]);
+  }, [stopArp, arpTick, isMidiClockSynced]);
+
+  const handlePadPress = useCallback((pad: PadState) => {
+    setActivePads(prev => [...prev, pad.id]);
+    if (pad.type === 'arp') {
+        if (arpPattern === pad.value) {
+            setArpIsActive(false);
+            setArpPattern(null);
+            stopArp();
+        } else {
+            setArpPattern(pad.value);
+            setArpIsActive(true);
+            if (heldKeys.current.size > 0 && !isMidiClockSynced) {
+               startArp();
+            }
+        }
+    } else if (pad.type === 'chord') {
+       activeChordNotes.current.forEach(note => audioService.stopNote(note));
+       const chordToPlay = chords[pad.id - 1]; // pad.id is 1-based
+       if (chordToPlay) {
+         const timbreValue = knobs.find(k => k.id === 7)?.value ?? 0;
+         const notesPlayed = audioService.playChord(chordToPlay.name, selectedKey, selectedScale, timbreValue);
+         activeChordNotes.current = notesPlayed;
+       }
+   }
+ }, [arpPattern, chords, knobs, selectedKey, selectedScale, startArp, stopArp, isMidiClockSynced]);
+
+  const handlePadRelease = useCallback((pad: PadState) => {
+    setActivePads(prev => prev.filter(pId => pId !== pad.id));
+    if (pad.type === 'chord') {
+        activeChordNotes.current.forEach(note => audioService.stopNote(note));
+        activeChordNotes.current = [];
+    }
+  }, []);
 
   const handleNoteOn = useCallback((note: number, velocity: number) => {
+    const padId = MIDI_PAD_NOTE_MAP[note];
+    if (padId) {
+        const pad = PADS.find(p => p.id === padId);
+        if (pad) {
+            handlePadPress(pad);
+            return; // Note is a pad, so don't treat it as a melodic note
+        }
+    }
+
     const timbreValue = knobs.find(k => k.id === 7)?.value ?? 0;
     if (arpIsActive) {
       const wasEmpty = heldKeys.current.size === 0;
       heldKeys.current.add(note);
-      if (wasEmpty) startArp();
+      if (wasEmpty && !isMidiClockSynced) startArp();
     } else {
       audioService.playNote(note, timbreValue);
     }
-  }, [arpIsActive, startArp, knobs]);
+  }, [arpIsActive, startArp, knobs, handlePadPress, isMidiClockSynced]);
 
   const handleNoteOff = useCallback((note: number) => {
+    const padId = MIDI_PAD_NOTE_MAP[note];
+    if (padId) {
+        const pad = PADS.find(p => p.id === padId);
+        if (pad) {
+            handlePadRelease(pad);
+            return; // Note is a pad
+        }
+    }
+
     if (arpIsActive) {
       heldKeys.current.delete(note);
-      if (heldKeys.current.size === 0) stopArp();
+      if (heldKeys.current.size === 0 && !isMidiClockSynced) stopArp();
     } else {
       audioService.stopNote(note);
     }
-  }, [arpIsActive, stopArp]);
+  }, [arpIsActive, stopArp, handlePadRelease, isMidiClockSynced]);
 
-    const handlePlay = useCallback(() => {
-      if (arpPattern) {
-        setArpIsActive(true);
-        if (heldKeys.current.size > 0) {
-            startArp();
-        }
+  const handlePlay = useCallback(() => {
+    if (isMidiClockSynced) return;
+    if (arpPattern) {
+      setArpIsActive(true);
+      if (heldKeys.current.size > 0) {
+          startArp();
       }
-    }, [arpPattern, startArp]);
+    }
+  }, [arpPattern, startArp, isMidiClockSynced]);
 
-    const handleStop = useCallback(() => {
-        if (arpIsActive) {
-            setArpIsActive(false);
-            stopArp();
+  const handleStop = useCallback(() => {
+      if (isMidiClockSynced) return;
+      if (arpIsActive) {
+          setArpIsActive(false);
+          stopArp();
+      }
+  }, [arpIsActive, stopArp, isMidiClockSynced]);
+
+  const handleRecord = useCallback(() => {
+      setIsRecording(prev => !prev);
+  }, []);
+  
+  const handleMidiStart = useCallback(() => {
+    setIsMidiClockSynced(true);
+    setArpIsActive(true);
+    clockTickCount.current = 0;
+    arpStep.current = 0;
+    bpmTimestamps.current = [];
+  }, []);
+  
+  const handleMidiContinue = useCallback(() => {
+    setIsMidiClockSynced(true);
+    setArpIsActive(true);
+  }, []);
+
+  const handleMidiStop = useCallback(() => {
+    setIsMidiClockSynced(false);
+    setArpIsActive(false);
+    setExternalBpm(null);
+    stopArp();
+  }, [stopArp]);
+
+  const handleMidiClock = useCallback(() => {
+    if (!isMidiClockSynced && clockTickCount.current > 0) return; // Ignore stray clocks if not started
+    if (!isMidiClockSynced) setIsMidiClockSynced(true);
+
+    const now = performance.now();
+    bpmTimestamps.current.push(now);
+    if (bpmTimestamps.current.length > 48) {
+        bpmTimestamps.current.shift();
+    }
+
+    if (bpmTimestamps.current.length > 2) {
+      const first = bpmTimestamps.current[0];
+      const last = bpmTimestamps.current[bpmTimestamps.current.length - 1];
+      const ticks = bpmTimestamps.current.length - 1;
+      const avgMsPerTick = (last - first) / ticks;
+      const bpm = 60000 / (avgMsPerTick * 24);
+      setExternalBpm(Math.round(bpm));
+    }
+    
+    const masterClock = clockTickCount.current++;
+    const tickInBeat = masterClock % 24;
+    
+    // Main beat visualization trigger (quarter note)
+    if (tickInBeat === 0) {
+        setLastBeatTimestamp(performance.now());
+    }
+    
+    const swingKnobValue = knobs.find(k => k.id === 3)?.value ?? 0;
+
+    // Off-beat swing visualization trigger
+    if (swingKnobValue > 0) {
+        // Standard swing ratio: max delay is 2/3 of an 8th note's duration.
+        const swingRatio = (swingKnobValue / 100) * (2/3);
+        // An 8th note is 12 MIDI clock ticks.
+        const swingDelayInTicks = Math.round(12 * swingRatio);
+        const offBeatTickPosition = 12 + swingDelayInTicks;
+
+        if (tickInBeat === offBeatTickPosition) {
+            setLastOffBeatTimestamp(performance.now());
         }
-    }, [arpIsActive, stopArp]);
+    }
+    
+    if(arpIsActive && arpPattern && heldKeys.current.size > 0) {
+      const densityKnobValue = knobs.find(k => k.id === 2)?.value ?? 50;
+      const arpDivider = getArpDivider(densityKnobValue);
+      let shouldTrigger = false;
+      
+      if (swingKnobValue === 0) {
+          if (masterClock % arpDivider === 0) {
+              shouldTrigger = true;
+          }
+      } else {
+          const periodInTicks = arpDivider * 2; 
+          const tickWithinPeriod = masterClock % periodInTicks;
+          const swingRatio = (swingKnobValue / 100) * (2/3);
+          const swingDelayInTicks = Math.round(arpDivider * swingRatio);
+          const onBeatTick = 0;
+          const offBeatTick = Math.min(arpDivider + swingDelayInTicks, periodInTicks - 1);
+          
+          if (tickWithinPeriod === onBeatTick || tickWithinPeriod === offBeatTick) {
+              shouldTrigger = true;
+          }
+      }
 
-    const handleRecord = useCallback(() => {
-        setIsRecording(prev => !prev);
-    }, []);
+      if(shouldTrigger) {
+        arpStepForward();
+      }
+    }
+
+  }, [isMidiClockSynced, arpIsActive, arpPattern, knobs, arpStepForward]);
 
   const handleControlChange = useCallback((controller: number, value: number) => {
     const knobId = MIDI_KNOB_CC_MAP[controller];
     if (knobId) {
       handleKnobChange(knobId, Math.round((value / 127) * 100));
     }
+
+    const directParam = MIDI_DIRECT_PARAM_CC_MAP[controller];
+    if (directParam) {
+        let knobToUpdateId: number | null = null;
+        switch(directParam) {
+            case 'glide': knobToUpdateId = 9; break;
+            case 'filterResonance': knobToUpdateId = 6; break;
+            case 'fxDepth': knobToUpdateId = 4; break;
+            case 'mixFx': knobToUpdateId = 8; break;
+            case 'attack': knobToUpdateId = 10; break;
+            case 'decay': knobToUpdateId = 11; break;
+            case 'sustain': knobToUpdateId = 12; break;
+            case 'release': knobToUpdateId = 13; break;
+        }
+        if (knobToUpdateId !== null) {
+            handleKnobChange(knobToUpdateId, Math.round((value / 127) * 100));
+        }
+    }
+
     if (value > 64) {
       switch (controller) {
         case MIDI_TRANSPORT_CC.PLAY:
@@ -213,54 +420,55 @@ const App: React.FC = () => {
     service.onNoteOn = handleNoteOn;
     service.onNoteOff = handleNoteOff;
     service.onControlChange = handleControlChange;
-  }, [handleNoteOn, handleNoteOff, handleControlChange]);
+    service.onStart = handleMidiStart;
+    service.onContinue = handleMidiContinue;
+    service.onStop = handleMidiStop;
+    service.onClock = handleMidiClock;
+  }, [handleNoteOn, handleNoteOff, handleControlChange, handleMidiStart, handleMidiContinue, handleMidiStop, handleMidiClock]);
 
   useEffect(() => {
-    const filterCutoffKnob = knobs.find(k => k.id === 5);
-    if (filterCutoffKnob) audioService.setFilterCutoff(filterCutoffKnob.value);
-    const filterResKnob = knobs.find(k => k.id === 6);
-    if (filterResKnob) audioService.setFilterResonance(filterResKnob.value);
-    const fxDepthKnob = knobs.find(k => k.id === 4);
-    if (fxDepthKnob) audioService.setFxDepth(fxDepthKnob.value);
-    const mixFxKnob = knobs.find(k => k.id === 8);
-    if (mixFxKnob) audioService.setMixFx(mixFxKnob.value);
-    const timbreKnob = knobs.find(k => k.id === 7);
-    if (timbreKnob) audioService.setTimbreParameter(timbreKnob.value);
+    // Synth Parameters
+    const getValue = (id: number) => knobs.find(k => k.id === id)?.value ?? 0;
+    audioService.setFilterCutoff(getValue(5));
+    audioService.setFilterResonance(getValue(6));
+    audioService.setFxDepth(getValue(4));
+    audioService.setMixFx(getValue(8));
+    audioService.setTimbreParameter(getValue(7));
+    audioService.setGlideTime(getValue(9));
+    
+    // ADSR Envelope
+    audioService.setAdsr(
+      getValue(10), // Attack
+      getValue(11), // Decay
+      getValue(12), // Sustain
+      getValue(13)  // Release
+    );
+
   }, [knobs]);
 
-  const handlePadPress = (pad: PadState) => {
-     setActivePads(prev => [...prev, pad.id]);
-     if (pad.type === 'arp') {
-         if (arpPattern === pad.value) {
-             setArpIsActive(false);
-             setArpPattern(null);
-             stopArp();
-         } else {
-             setArpPattern(pad.value);
-             if (arpIsActive && heldKeys.current.size > 0) {
-                startArp();
-             }
-         }
-     } else if (pad.type === 'chord') {
-        activeChordNotes.current.forEach(note => audioService.stopNote(note));
-        const timbreValue = knobs.find(k => k.id === 7)?.value ?? 0;
-        const notesPlayed = audioService.playChord(pad.value, selectedKey, selectedScale, timbreValue);
-        activeChordNotes.current = notesPlayed;
-    }
+  const handleHarmonyPadPress = (chordIndex: number) => {
+      setActiveHarmonyPads(prev => [...prev, chordIndex]);
+      activeChordNotes.current.forEach(note => audioService.stopNote(note));
+      const chordToPlay = chords[chordIndex];
+      if (chordToPlay) {
+          const timbreValue = knobs.find(k => k.id === 7)?.value ?? 0;
+          const notesPlayed = audioService.playChord(chordToPlay.name, selectedKey, selectedScale, timbreValue);
+          activeChordNotes.current = notesPlayed;
+      }
   };
 
-  const handlePadRelease = (pad: PadState) => {
-    setActivePads(prev => prev.filter(pId => pId !== pad.id));
-    if (pad.type === 'chord') {
-        activeChordNotes.current.forEach(note => audioService.stopNote(note));
-        activeChordNotes.current = [];
-    }
+  const handleHarmonyPadRelease = (chordIndex: number) => {
+      setActiveHarmonyPads(prev => prev.filter(pId => pId !== chordIndex));
+      activeChordNotes.current.forEach(note => audioService.stopNote(note));
+      activeChordNotes.current = [];
   };
 
   const handleGenerate = async () => {
     setIsGenerating(true);
     const newChords = await generateChordProgression(selectedKey, selectedScale);
-    setChords(newChords);
+    if (newChords && newChords.length > 0) {
+      setChords(newChords);
+    }
     setIsGenerating(false);
   };
 
@@ -268,7 +476,7 @@ const App: React.FC = () => {
     setSelectedEngine(engine);
     audioService.setEngine(engine);
   }, []);
-  
+
   useEffect(() => {
     try {
         const storedPresets = localStorage.getItem(USER_PRESETS_STORAGE_KEY);
@@ -320,8 +528,9 @@ const App: React.FC = () => {
       const blend = morphAmount / 100;
 
       // 1. Morph continuous knob values
-      const morphedKnobs = presetA.knobs.map((knobA, index) => {
-        const knobB = presetB.knobs[index];
+      const morphedKnobs = presetA.knobs.map((knobA) => {
+        const knobB = presetB.knobs.find(k => k.id === knobA.id);
+        if (!knobB) return knobA; // Should not happen if presets are valid
         const value = knobA.value + (knobB.value - knobA.value) * blend;
         return { ...knobA, value: Math.round(value) };
       });
@@ -342,7 +551,10 @@ const App: React.FC = () => {
       }
     }
   }, [morphA, morphB, morphAmount, userPresets, handleEngineChange, selectedEngine, selectedKey, selectedScale]);
-
+  
+  const synthKnobs = knobs.filter(k => k.id <= 9);
+  const envKnobs = knobs.filter(k => k.id > 9);
+  const swingAmount = knobs.find(k => k.id === 3)?.value ?? 0;
 
   return (
     <div className="h-screen bg-[#0c0a1a] p-4 sm:p-6 lg:p-8 flex flex-col space-y-4 overflow-y-auto lg:overflow-hidden">
@@ -350,7 +562,7 @@ const App: React.FC = () => {
           {/* LEFT COMMAND PANEL */}
           <aside className="w-full lg:w-[420px] lg:flex-shrink-0 flex flex-col gap-6">
               <GlobalControls 
-                  arpIsActive={arpPattern !== null}
+                  arpIsActive={arpIsActive && arpPattern !== null}
                   isRecording={isRecording}
                   activeTransport={activeTransport}
                   handlePlay={handlePlay}
@@ -358,9 +570,14 @@ const App: React.FC = () => {
                   handleRecord={handleRecord}
                   midiDevices={midiDevices}
                   onConnectMidi={() => midiServiceRef.current.requestMIDIAccess()}
+                  isMidiClockSynced={isMidiClockSynced}
+                  externalBpm={externalBpm}
+                  lastBeatTimestamp={lastBeatTimestamp}
+                  lastOffBeatTimestamp={lastOffBeatTimestamp}
+                  swingAmount={swingAmount}
               />
-              <PadBank onPadPress={handlePadPress} onPadRelease={handlePadRelease} activePads={activePads} armedPadValue={arpPattern} />
-              <HarmonyGenerator chords={chords} isLoading={isGenerating} onGenerate={handleGenerate} />
+              <PadBank onPadPress={handlePadPress} onPadRelease={handlePadRelease} activePads={activePads} armedPadValue={arpPattern} chords={chords} />
+              <HarmonyGenerator chords={chords} isLoading={isGenerating} onGenerate={handleGenerate} onPadPress={handleHarmonyPadPress} onPadRelease={handleHarmonyPadRelease} activePads={activeHarmonyPads}/>
               <PresetManager userPresets={userPresets} factoryPresets={PRESETS} onSave={handleSavePreset} onLoad={handleLoadPreset} onDelete={handleDeletePreset} morphA={morphA} morphB={morphB} morphAmount={morphAmount} onSetMorphA={setMorphA} onSetMorphB={setMorphB} onSetMorphAmount={setMorphAmount}/>
           </aside>
           
@@ -371,10 +588,12 @@ const App: React.FC = () => {
 
           {/* RIGHT SYNTH CONTROLS */}
           <aside className="w-full lg:w-[420px] lg:flex-shrink-0 flex flex-col gap-6">
-              <ControlPanel knobs={knobs} onKnobChange={handleKnobChange} arpIsActive={arpPattern !== null} />
+              <ControlPanel knobs={synthKnobs} onKnobChange={handleKnobChange} arpIsActive={arpIsActive && arpPattern !== null} />
+              <EnvelopePanel knobs={envKnobs} onKnobChange={handleKnobChange} />
               <div className="bg-black/40 backdrop-blur-md border border-white/10 rounded-lg p-4 flex flex-col gap-4">
                  <CustomSelect label="KEY" value={selectedKey} onChange={setSelectedKey} options={KEYS} />
                  <CustomSelect label="SCALE" value={selectedScale} onChange={setSelectedScale} options={SCALES} />
+                 {/* FIX: Corrected typo from ENGNES to ENGINES */}
                  <CustomSelect label="ENGINE" value={selectedEngine} onChange={(val) => handleEngineChange(val as SynthEngine)} options={ENGINES} />
               </div>
           </aside>

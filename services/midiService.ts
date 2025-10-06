@@ -6,6 +6,10 @@ export class MidiService {
   public onNoteOn: (note: number, velocity: number) => void = () => {};
   public onNoteOff: (note: number) => void = () => {};
   public onControlChange: (controller: number, value: number) => void = () => {};
+  public onClock: () => void = () => {};
+  public onStart: () => void = () => {};
+  public onStop: () => void = () => {};
+  public onContinue: () => void = () => {};
   
   constructor() {
     // The constructor is now empty, no longer taking callbacks.
@@ -51,6 +55,23 @@ export class MidiService {
   // FIX: Use standard MIDIMessageEvent type instead of WebMidi.MIDIMessageEvent
   private handleMIDIMessage(message: MIDIMessageEvent) {
     const [command, note, velocity] = message.data;
+
+    // System Real-Time Messages (single byte)
+    switch(command) {
+        case 248: // 0xF8 Timing Clock
+            this.onClock();
+            return;
+        case 250: // 0xFA Start
+            this.onStart();
+            return;
+        case 251: // 0xFB Continue
+            this.onContinue();
+            return;
+        case 252: // 0xFC Stop
+            this.onStop();
+            return;
+    }
+
 
     // Use the public callback properties to handle events
     switch (command & 0xF0) {

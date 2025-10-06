@@ -34,6 +34,14 @@ class AudioService {
   private analyser: AnalyserNode | null = null;
   private activeVoices: Map<number, ActiveVoice> = new Map();
   private currentEngine: SynthEngine = 'Analog';
+  private lastNoteFrequency: number | null = null;
+  private glideTime: number = 0; // in seconds
+  private adsr = {
+    attack: 0.02,
+    decay: 0.1,
+    sustain: 0.8,
+    release: 0.5,
+  };
 
   constructor() {
     this.init();
@@ -162,35 +170,61 @@ class AudioService {
     if (this.activeVoices.has(midiNote)) return;
 
     this.audioContext.resume();
+    
+    const targetFrequency = this.midiToFrequency(midiNote);
+    const isLegato = this.activeVoices.size > 0;
+    const startFrequency = (isLegato && this.glideTime > 0 && this.lastNoteFrequency)
+      ? this.lastNoteFrequency
+      : targetFrequency;
 
     let voice: ActiveVoice;
     switch (this.currentEngine) {
       case 'FM':
-        voice = this.createFMVoice(midiNote, timbreValue);
+        voice = this.createFMVoice(startFrequency, targetFrequency, timbreValue);
         break;
       case 'Reed Piano':
-        voice = this.createPianoVoice(midiNote, timbreValue);
+        voice = this.createPianoVoice(startFrequency, targetFrequency, timbreValue);
         break;
       case 'Hang Drum':
-        voice = this.createHangDrumVoice(midiNote, timbreValue);
+        voice = this.createHangDrumVoice(startFrequency, targetFrequency, timbreValue);
         break;
       case 'String Machine':
-        voice = this.createStringMachineVoice(midiNote, timbreValue);
+        voice = this.createStringMachineVoice(startFrequency, targetFrequency, timbreValue);
         break;
       case 'Analog':
       default:
-        voice = this.createAnalogVoice(midiNote, timbreValue);
+        voice = this.createAnalogVoice(startFrequency, targetFrequency, timbreValue);
         break;
     }
     this.activeVoices.set(midiNote, voice);
+    this.lastNoteFrequency = targetFrequency;
   }
 
-  private createAnalogVoice(midiNote: number, timbreValue: number): ActiveVoice {
+  private applyAdsr(gainNode: GainNode, startTime: number) {
+    const { attack, decay, sustain } = this.adsr;
+    gainNode.gain.cancelScheduledValues(startTime);
+    gainNode.gain.setValueAtTime(0, startTime);
+    gainNode.gain.linearRampToValueAtTime(1.0, startTime + attack);
+    gainNode.gain.setTargetAtTime(sustain, startTime + attack, decay / 3 + 0.001);
+  }
+
+  private triggerRelease(gainNode: GainNode, stopTime: number): number {
+    const { release } = this.adsr;
+    gainNode.gain.cancelScheduledValues(stopTime);
+    gainNode.gain.setValueAtTime(gainNode.gain.value, stopTime);
+    gainNode.gain.linearRampToValueAtTime(0, stopTime + release);
+    return stopTime + release;
+  }
+
+  private createAnalogVoice(startFrequency: number, targetFrequency: number, timbreValue: number): ActiveVoice {
     const { audioContext, masterGain } = this;
     if (!audioContext || !masterGain) throw new Error("Audio context not ready");
 
     const oscillator = audioContext.createOscillator();
     const noteGain = audioContext.createGain();
+    const now = audioContext.currentTime;
+    
+    this.applyAdsr(noteGain, now);
     
     const setTimbre = (value: number) => {
         let type: OscillatorType = 'sine';
@@ -201,86 +235,87 @@ class AudioService {
     };
     
     setTimbre(timbreValue);
-    oscillator.frequency.setValueAtTime(this.midiToFrequency(midiNote), audioContext.currentTime);
     
-    noteGain.gain.setValueAtTime(0, audioContext.currentTime);
-    noteGain.gain.linearRampToValueAtTime(1, audioContext.currentTime + 0.02);
+    oscillator.frequency.setValueAtTime(startFrequency, now);
+    if (startFrequency !== targetFrequency && this.glideTime > 0) {
+        oscillator.frequency.linearRampToValueAtTime(targetFrequency, now + this.glideTime);
+    }
 
     oscillator.connect(noteGain);
     noteGain.connect(masterGain);
-    oscillator.start();
+    oscillator.start(now);
 
     const stop = () => {
-      const now = audioContext.currentTime;
-      noteGain.gain.cancelScheduledValues(now);
-      noteGain.gain.setValueAtTime(noteGain.gain.value, now);
-      noteGain.gain.linearRampToValueAtTime(0, now + 0.2);
-      oscillator.stop(now + 0.2);
+      const stopNow = audioContext.currentTime;
+      const releaseEndTime = this.triggerRelease(noteGain, stopNow);
+      oscillator.stop(releaseEndTime);
     };
 
     return { stop, setTimbre };
   }
   
-  private createFMVoice(midiNote: number, timbreValue: number): ActiveVoice {
+  private createFMVoice(startFrequency: number, targetFrequency: number, timbreValue: number): ActiveVoice {
     const { audioContext, masterGain } = this;
     if (!audioContext || !masterGain) throw new Error("Audio context not ready");
 
     const carrier = audioContext.createOscillator();
-    carrier.frequency.setValueAtTime(this.midiToFrequency(midiNote), audioContext.currentTime);
-
     const modulator = audioContext.createOscillator();
-    modulator.frequency.setValueAtTime(this.midiToFrequency(midiNote), audioContext.currentTime); // Simple 1:1 ratio
-    
     const modulatorGain = audioContext.createGain();
+    const noteGain = audioContext.createGain();
+    const now = audioContext.currentTime;
+
+    this.applyAdsr(noteGain, now);
+
+    carrier.frequency.setValueAtTime(startFrequency, now);
+    modulator.frequency.setValueAtTime(startFrequency, now); // Simple 1:1 ratio
+    
+    if (startFrequency !== targetFrequency && this.glideTime > 0) {
+        const glideEndTime = now + this.glideTime;
+        carrier.frequency.linearRampToValueAtTime(targetFrequency, glideEndTime);
+        modulator.frequency.linearRampToValueAtTime(targetFrequency, glideEndTime);
+    }
 
     modulator.connect(modulatorGain);
     modulatorGain.connect(carrier.frequency);
-
-    const noteGain = audioContext.createGain();
-    noteGain.gain.setValueAtTime(0, audioContext.currentTime);
-    noteGain.gain.linearRampToValueAtTime(1, audioContext.currentTime + 0.02);
     
     carrier.connect(noteGain);
     noteGain.connect(masterGain);
 
     const setTimbre = (value: number) => {
-        // value 0-100 maps to modulation index
         const modAmount = value * 10;
         modulatorGain.gain.setTargetAtTime(modAmount, audioContext.currentTime, 0.01);
     };
     
     setTimbre(timbreValue);
     
-    carrier.start();
-    modulator.start();
+    carrier.start(now);
+    modulator.start(now);
 
     const stop = () => {
-        const now = audioContext.currentTime;
-        noteGain.gain.cancelScheduledValues(now);
-        noteGain.gain.setValueAtTime(noteGain.gain.value, now);
-        noteGain.gain.linearRampToValueAtTime(0, now + 0.2);
-        carrier.stop(now + 0.2);
-        modulator.stop(now + 0.2);
+        const stopNow = audioContext.currentTime;
+        const releaseEndTime = this.triggerRelease(noteGain, stopNow);
+        carrier.stop(releaseEndTime);
+        modulator.stop(releaseEndTime);
     };
 
     return { stop, setTimbre };
   }
 
-  private createPianoVoice(midiNote: number, timbreValue: number): ActiveVoice {
+  private createPianoVoice(startFrequency: number, targetFrequency: number, timbreValue: number): ActiveVoice {
     const { audioContext, masterGain } = this;
     if (!audioContext || !masterGain) throw new Error("Audio context not ready");
 
     const osc = audioContext.createOscillator();
     osc.type = 'sawtooth';
-    osc.frequency.setValueAtTime(this.midiToFrequency(midiNote), audioContext.currentTime);
+    const now = audioContext.currentTime;
+    
+    osc.frequency.setValueAtTime(startFrequency, now);
+    if (startFrequency !== targetFrequency && this.glideTime > 0) {
+        osc.frequency.linearRampToValueAtTime(targetFrequency, now + this.glideTime);
+    }
 
     const noteGain = audioContext.createGain();
-    
-    // Piano-like envelope
-    const now = audioContext.currentTime;
-    noteGain.gain.setValueAtTime(0, now);
-    noteGain.gain.linearRampToValueAtTime(0.8, now + 0.02); // Quick attack
-    noteGain.gain.exponentialRampToValueAtTime(0.1, now + 0.5); // Decay
+    this.applyAdsr(noteGain, now);
 
     const waveshaper = audioContext.createWaveShaper();
     
@@ -303,51 +338,48 @@ class AudioService {
     };
 
     setTimbre(timbreValue);
-    osc.start();
+    osc.start(now);
 
     const stop = () => {
       const stopNow = audioContext.currentTime;
-      noteGain.gain.cancelScheduledValues(stopNow);
-      noteGain.gain.setValueAtTime(noteGain.gain.value, stopNow);
-      noteGain.gain.linearRampToValueAtTime(0, stopNow + 0.15); // Short release
-      osc.stop(stopNow + 0.15);
+      const releaseEndTime = this.triggerRelease(noteGain, stopNow);
+      osc.stop(releaseEndTime);
     };
     
     return { stop, setTimbre };
   }
 
-  private createHangDrumVoice(midiNote: number, timbreValue: number): ActiveVoice {
+  private createHangDrumVoice(startFrequency: number, targetFrequency: number, timbreValue: number): ActiveVoice {
     const { audioContext, masterGain } = this;
     if (!audioContext || !masterGain) throw new Error("Audio context not ready");
 
-    const fundamentalFreq = this.midiToFrequency(midiNote);
     const now = audioContext.currentTime;
-
-    // This gain node will handle the overall percussive envelope
     const envelope = audioContext.createGain();
+    this.applyAdsr(envelope, now);
     envelope.connect(masterGain);
     
-    // ADSR-like envelope for a percussive sound
-    envelope.gain.setValueAtTime(0, now);
-    envelope.gain.linearRampToValueAtTime(0.6, now + 0.01); // Quick attack, not too loud
-    envelope.gain.exponentialRampToValueAtTime(0.0001, now + 4); // Long, natural decay
-
-    // --- Oscillators ---
     const fundamentalOsc = audioContext.createOscillator();
     fundamentalOsc.type = 'sine';
-    fundamentalOsc.frequency.value = fundamentalFreq;
+    fundamentalOsc.frequency.setValueAtTime(startFrequency, now);
 
     const partial1Osc = audioContext.createOscillator();
     partial1Osc.type = 'sine';
-    partial1Osc.frequency.value = fundamentalFreq * 2.0; // Octave
     const partial1Gain = audioContext.createGain();
 
     const partial2Osc = audioContext.createOscillator();
     partial2Osc.type = 'sine';
-    partial2Osc.frequency.value = fundamentalFreq * 3.0; // Fifth above octave
     const partial2Gain = audioContext.createGain();
     
-    // Connect all sound sources to the main envelope
+    if (startFrequency !== targetFrequency && this.glideTime > 0) {
+        const glideEndTime = now + this.glideTime;
+        fundamentalOsc.frequency.linearRampToValueAtTime(targetFrequency, glideEndTime);
+        partial1Osc.frequency.linearRampToValueAtTime(targetFrequency * 2.0, glideEndTime);
+        partial2Osc.frequency.linearRampToValueAtTime(targetFrequency * 3.0, glideEndTime);
+    } else {
+        partial1Osc.frequency.setValueAtTime(startFrequency * 2.0, now);
+        partial2Osc.frequency.setValueAtTime(startFrequency * 3.0, now);
+    }
+    
     fundamentalOsc.connect(envelope);
     partial1Osc.connect(partial1Gain);
     partial2Osc.connect(partial2Gain);
@@ -357,13 +389,7 @@ class AudioService {
     const oscillators = [fundamentalOsc, partial1Osc, partial2Osc];
     oscillators.forEach(osc => osc.start(now));
     
-    // The note will naturally stop playing after the envelope finishes.
-    const stopTime = now + 4.1;
-    oscillators.forEach(osc => osc.stop(stopTime));
-
-
     const setTimbre = (value: number) => {
-      // Timbre morph controls the volume of the partials (harmonics)
       const partialsVolume = (value / 100);
       partial1Gain.gain.setTargetAtTime(0.5 * partialsVolume, audioContext.currentTime, 0.01);
       partial2Gain.gain.setTargetAtTime(0.3 * partialsVolume, audioContext.currentTime, 0.01);
@@ -372,50 +398,39 @@ class AudioService {
     setTimbre(timbreValue);
 
     const stop = () => {
-      // For an immediate, forced stop (e.g., stopping an arp or note off)
       const stopNow = audioContext.currentTime;
-      envelope.gain.cancelScheduledValues(stopNow);
-      envelope.gain.setValueAtTime(envelope.gain.value, stopNow);
-      envelope.gain.linearRampToValueAtTime(0, stopNow + 0.05); // Very quick release
+      const releaseEndTime = this.triggerRelease(envelope, stopNow);
+      oscillators.forEach(osc => osc.stop(releaseEndTime));
     };
     
     return { stop, setTimbre };
   }
 
-  private createStringMachineVoice(midiNote: number, timbreValue: number): ActiveVoice {
+  private createStringMachineVoice(startFrequency: number, targetFrequency: number, timbreValue: number): ActiveVoice {
     const { audioContext, masterGain } = this;
     if (!audioContext || !masterGain) throw new Error("Audio context not ready");
 
     const noteGain = audioContext.createGain();
     const now = audioContext.currentTime;
-    
-    // Slow attack, long release envelope for a pad sound
-    noteGain.gain.setValueAtTime(0, now);
-    noteGain.gain.linearRampToValueAtTime(0.5, now + 0.3); // Slow attack
+    this.applyAdsr(noteGain, now);
     noteGain.connect(masterGain);
 
-    const freq = this.midiToFrequency(midiNote);
-
-    // Create three oscillators for a classic detuned string sound
     const osc1 = audioContext.createOscillator();
     const osc2 = audioContext.createOscillator();
     const osc3 = audioContext.createOscillator();
     
-    osc1.type = 'sawtooth';
-    osc2.type = 'sawtooth';
-    osc3.type = 'sawtooth';
-
-    osc1.frequency.value = freq;
-
-    osc1.connect(noteGain);
-    osc2.connect(noteGain);
-    osc3.connect(noteGain);
-
     const oscillators = [osc1, osc2, osc3];
-    oscillators.forEach(osc => osc.start(now));
+    oscillators.forEach(osc => {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(startFrequency, now);
+        if (startFrequency !== targetFrequency && this.glideTime > 0) {
+            osc.frequency.linearRampToValueAtTime(targetFrequency, now + this.glideTime);
+        }
+        osc.connect(noteGain);
+        osc.start(now);
+    });
 
     const setTimbre = (value: number) => {
-        // Timbre morph controls the detune amount in cents
         const detuneAmount = value * 0.2; // Max 20 cents
         osc2.detune.setTargetAtTime(detuneAmount, audioContext.currentTime, 0.01);
         osc3.detune.setTargetAtTime(-detuneAmount, audioContext.currentTime, 0.01);
@@ -425,11 +440,8 @@ class AudioService {
 
     const stop = () => {
       const stopNow = audioContext.currentTime;
-      noteGain.gain.cancelScheduledValues(stopNow);
-      noteGain.gain.setValueAtTime(noteGain.gain.value, stopNow);
-      // Long release
-      noteGain.gain.linearRampToValueAtTime(0, stopNow + 1.5); 
-      oscillators.forEach(osc => osc.stop(stopNow + 1.5));
+      const releaseEndTime = this.triggerRelease(noteGain, stopNow);
+      oscillators.forEach(osc => osc.stop(releaseEndTime));
     };
     
     return { stop, setTimbre };
@@ -441,6 +453,9 @@ class AudioService {
     if (activeNote) {
       activeNote.stop();
       this.activeVoices.delete(midiNote);
+    }
+    if (this.activeVoices.size === 0) {
+      this.lastNoteFrequency = null;
     }
   }
 
@@ -475,6 +490,19 @@ class AudioService {
     if (!this.delay || !this.audioContext) return;
      const delayTime = (value / 100) * 1.0;
      this.delay.delayTime.setTargetAtTime(delayTime, this.audioContext.currentTime, 0.01);
+  }
+
+  public setGlideTime(value: number) { // value is 0-100
+    // Use an exponential curve for a more musical feel, max 1.5s
+    this.glideTime = Math.pow(value / 100, 2) * 1.5;
+  }
+  
+  public setAdsr(attack: number, decay: number, sustain: number, release: number) {
+    // values are 0-100 from knobs
+    this.adsr.attack = 0.005 + Math.pow(attack / 100, 2) * 2; // 0 to 2s
+    this.adsr.decay = 0.005 + Math.pow(decay / 100, 2) * 2; // 0 to 2s
+    this.adsr.sustain = sustain / 100; // 0 to 1
+    this.adsr.release = 0.005 + Math.pow(release / 100, 2) * 5; // 0 to 5s
   }
 }
 

@@ -28,11 +28,11 @@ const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({ knobs }) => {
     const particlesRef = useRef<Particle[]>([]);
     const mousePosition = useRef<{ x: number | null, y: number | null }>({ x: null, y: null });
     const gridOffset = useRef(0);
+    const isDragging = useRef(false);
+    const activeTouches = useRef(new Map<number, { x: number, y: number }>());
     
     const [colorScheme, setColorScheme] = useState('synthwavePink');
-    const [particleDensity, setParticleDensity] = useState(50); // 0-100
-
-    const activeTouches = useRef(new Map<number, { x: number, y: number }>());
+    const [particleDensity, setParticleDensity] = useState(50);
 
     const initParticles = useCallback(() => {
         const canvas = canvasRef.current;
@@ -52,32 +52,6 @@ const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({ knobs }) => {
         }
     }, [particleDensity]);
 
-    const handleTouchUpdate = useCallback(() => {
-        const touches = Array.from(activeTouches.current.values());
-        const canvas = canvasRef.current;
-        if (!canvas || touches.length === 0) return;
-
-        const avg = touches.reduce((acc, t) => ({ x: acc.x + t.x, y: acc.y + t.y }), { x: 0, y: 0 });
-        avg.x /= touches.length;
-        avg.y /= touches.length;
-
-        const cutoff = (avg.x / canvas.clientWidth) * 100;
-        const resonance = (1 - (avg.y / canvas.clientHeight)) * 100;
-
-        audioService.setFilterCutoff(Math.max(0, Math.min(100, cutoff)));
-        audioService.setFilterResonance(Math.max(0, Math.min(100, resonance)));
-
-        if (touches.length >= 2) {
-            const [t1, t2] = touches;
-            const dx = t1.x - t2.x;
-            const dy = t1.y - t2.y;
-            const distance = Math.sqrt(dx * dx + dy * dy);
-            const maxDistance = Math.sqrt(Math.pow(canvas.clientWidth, 2) + Math.pow(canvas.clientHeight, 2));
-            const fxDepth = (distance / (maxDistance * 0.75)) * 100; // Use 75% of max distance as a more reachable max
-            audioService.setFxDepth(Math.max(0, Math.min(100, fxDepth)));
-        }
-    }, []);
-
     const returnToKnobValues = useCallback(() => {
         const cutoffKnob = knobs.find(k => k.id === 5)?.value ?? 80;
         const resKnob = knobs.find(k => k.id === 6)?.value ?? 20;
@@ -88,9 +62,56 @@ const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({ knobs }) => {
         audioService.setFxDepth(fxKnob);
     }, [knobs]);
 
+    const updateFilterFromPoint = useCallback((x: number, y: number) => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+
+        const cutoff = (x / canvas.clientWidth) * 100;
+        const resonance = (1 - (y / canvas.clientHeight)) * 100;
+
+        audioService.setFilterCutoff(Math.max(0, Math.min(100, cutoff)));
+        audioService.setFilterResonance(Math.max(0, Math.min(100, resonance)));
+    }, []);
+
+    const handleTouchUpdate = useCallback(() => {
+        const touches = Array.from(activeTouches.current.values());
+        const canvas = canvasRef.current;
+        if (!canvas || touches.length === 0) return;
+
+        const avg = touches.reduce((acc, t) => ({ x: acc.x + t.x, y: acc.y + t.y }), { x: 0, y: 0 });
+        avg.x /= touches.length;
+        avg.y /= touches.length;
+
+        updateFilterFromPoint(avg.x, avg.y);
+
+        if (touches.length >= 2) {
+            const [t1, t2] = touches;
+            const dx = t1.x - t2.x;
+            const dy = t1.y - t2.y;
+            const distance = Math.sqrt(dx * dx + dy * dy);
+            const maxDistance = Math.sqrt(Math.pow(canvas.clientWidth, 2) + Math.pow(canvas.clientHeight, 2));
+            const fxDepth = (distance / (maxDistance * 0.75)) * 100;
+            audioService.setFxDepth(Math.max(0, Math.min(100, fxDepth)));
+        } else if (touches.length === 1) {
+            // Revert FX depth to knob value when pinch ends but one finger remains
+            const fxKnob = knobs.find(k => k.id === 4)?.value ?? 40;
+            audioService.setFxDepth(fxKnob);
+        }
+    }, [updateFilterFromPoint, knobs]);
+
     useEffect(() => {
         const canvas = canvasRef.current;
         if (!canvas) return;
+
+        const handleResize = () => {
+            const dpr = window.devicePixelRatio || 1;
+            const rect = canvas.getBoundingClientRect();
+            canvas.width = rect.width * dpr;
+            canvas.height = rect.height * dpr;
+            const ctx = canvas.getContext('2d');
+            if (ctx) ctx.scale(dpr, dpr);
+            initParticles();
+        };
 
         const onTouchStart = (e: TouchEvent) => {
             e.preventDefault();
@@ -122,51 +143,60 @@ const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({ knobs }) => {
             }
         };
 
+        const handleMouseMove = (event: MouseEvent) => {
+            const rect = canvas.getBoundingClientRect();
+            const x = event.clientX - rect.left;
+            const y = event.clientY - rect.top;
+            mousePosition.current = { x, y };
+            if (isDragging.current) {
+                updateFilterFromPoint(x, y);
+            }
+        };
+        const handleMouseDown = (event: MouseEvent) => {
+            if (event.button !== 0) return;
+            isDragging.current = true;
+            const rect = canvas.getBoundingClientRect();
+            const x = event.clientX - rect.left;
+            const y = event.clientY - rect.top;
+            updateFilterFromPoint(x, y);
+        };
+        const handleMouseUp = () => {
+            if (isDragging.current) {
+                isDragging.current = false;
+                returnToKnobValues();
+            }
+        };
+        const handleMouseLeave = () => {
+            mousePosition.current = { x: null, y: null };
+            if (isDragging.current) {
+                isDragging.current = false;
+                returnToKnobValues();
+            }
+        };
+        
+        window.addEventListener('resize', handleResize);
+        handleResize();
         canvas.addEventListener('touchstart', onTouchStart, { passive: false });
         canvas.addEventListener('touchmove', onTouchMove, { passive: false });
         canvas.addEventListener('touchend', onTouchEnd, { passive: false });
         canvas.addEventListener('touchcancel', onTouchEnd, { passive: false });
+        canvas.addEventListener('mousemove', handleMouseMove);
+        canvas.addEventListener('mousedown', handleMouseDown);
+        window.addEventListener('mouseup', handleMouseUp);
+        canvas.addEventListener('mouseleave', handleMouseLeave);
 
         return () => {
+            window.removeEventListener('resize', handleResize);
             canvas.removeEventListener('touchstart', onTouchStart);
             canvas.removeEventListener('touchmove', onTouchMove);
             canvas.removeEventListener('touchend', onTouchEnd);
             canvas.removeEventListener('touchcancel', onTouchEnd);
-        };
-    }, [handleTouchUpdate, returnToKnobValues]);
-
-    useEffect(() => {
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-        const handleResize = () => {
-            const dpr = window.devicePixelRatio || 1;
-            const rect = canvas.getBoundingClientRect();
-            canvas.width = rect.width * dpr;
-            canvas.height = rect.height * dpr;
-            const ctx = canvas.getContext('2d');
-            if (ctx) ctx.scale(dpr, dpr);
-            initParticles();
-        };
-        window.addEventListener('resize', handleResize);
-        handleResize();
-        return () => window.removeEventListener('resize', handleResize);
-    }, [initParticles]);
-    
-    useEffect(() => {
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-        const handleMouseMove = (event: MouseEvent) => {
-            const rect = canvas.getBoundingClientRect();
-            mousePosition.current = { x: event.clientX - rect.left, y: event.clientY - rect.top };
-        };
-        const handleMouseLeave = () => { mousePosition.current = { x: null, y: null }; };
-        canvas.addEventListener('mousemove', handleMouseMove);
-        canvas.addEventListener('mouseleave', handleMouseLeave);
-        return () => {
             canvas.removeEventListener('mousemove', handleMouseMove);
+            canvas.removeEventListener('mousedown', handleMouseDown);
+            window.removeEventListener('mouseup', handleMouseUp);
             canvas.removeEventListener('mouseleave', handleMouseLeave);
         };
-    }, []);
+    }, [initParticles, handleTouchUpdate, returnToKnobValues, updateFilterFromPoint]);
 
     const drawGrid = (ctx: CanvasRenderingContext2D, width: number, height: number, color: string) => {
         ctx.save();
@@ -194,21 +224,70 @@ const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({ knobs }) => {
         ctx.restore();
     };
     
-    const drawTouchFeedback = (ctx: CanvasRenderingContext2D, scheme: any) => {
+    const drawInteractionFeedback = (ctx: CanvasRenderingContext2D, scheme: any, width: number, height: number) => {
         const touches = Array.from(activeTouches.current.values());
-        if (touches.length === 0) return;
+        
+        ctx.save();
+        ctx.shadowBlur = 15;
+        ctx.shadowColor = scheme.shadow;
 
-        touches.forEach((touch, index) => {
-            ctx.beginPath();
-            ctx.arc(touch.x, touch.y, 30, 0, Math.PI * 2);
-            ctx.fillStyle = index === 0 ? `${scheme.primary}55` : `${scheme.particle}55`;
-            ctx.fill();
+        let interactionPoint: {x: number, y: number} | null = null;
+        if (touches.length > 0) {
+            const avg = touches.reduce((acc, t) => ({ x: acc.x + t.x, y: acc.y + t.y }), { x: 0, y: 0 });
+            avg.x /= touches.length;
+            avg.y /= touches.length;
+            interactionPoint = avg;
+        } else if (isDragging.current && mousePosition.current.x !== null && mousePosition.current.y !== null) {
+            interactionPoint = mousePosition.current;
+        }
 
+        if (interactionPoint) {
             ctx.beginPath();
-            ctx.arc(touch.x, touch.y, 10, 0, Math.PI * 2);
+            ctx.arc(interactionPoint.x, interactionPoint.y, 15, 0, Math.PI * 2);
+            ctx.strokeStyle = scheme.primary;
+            ctx.lineWidth = 3;
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(interactionPoint.x - 20, interactionPoint.y);
+            ctx.lineTo(interactionPoint.x + 20, interactionPoint.y);
+            ctx.moveTo(interactionPoint.x, interactionPoint.y - 20);
+            ctx.lineTo(interactionPoint.x, interactionPoint.y + 20);
+            ctx.strokeStyle = `${scheme.primary}99`;
+            ctx.lineWidth = 1;
+            ctx.stroke();
+
+            const cutoff = Math.round((interactionPoint.x / width) * 100);
+            const resonance = Math.round((1 - (interactionPoint.y / height)) * 100);
+            ctx.font = '12px Orbitron, sans-serif';
+            ctx.fillStyle = `${scheme.primary}cc`;
+            ctx.textAlign = 'left';
+            ctx.fillText(`Cutoff: ${cutoff}%`, interactionPoint.x + 25, interactionPoint.y);
+            ctx.fillText(`Reso: ${resonance}%`, interactionPoint.x + 25, interactionPoint.y + 15);
+        }
+
+        if (touches.length >= 2) {
+            const [t1, t2] = touches;
+            ctx.beginPath();
+            ctx.moveTo(t1.x, t1.y);
+            ctx.lineTo(t2.x, t2.y);
+            ctx.strokeStyle = scheme.primary;
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            
+            const dx = t1.x - t2.x;
+            const dy = t1.y - t2.y;
+            const distance = Math.sqrt(dx * dx + dy * dy);
+            const maxDistance = Math.sqrt(Math.pow(width, 2) + Math.pow(height, 2));
+            const fxDepth = Math.round(Math.min(100, (distance / (maxDistance * 0.75)) * 100));
+
+            const midX = (t1.x + t2.x) / 2;
+            const midY = (t1.y + t2.y) / 2;
+            ctx.font = '14px Orbitron, sans-serif';
             ctx.fillStyle = scheme.primary;
-            ctx.fill();
-        });
+            ctx.textAlign = 'center';
+            ctx.fillText(`FX Depth: ${fxDepth}%`, midX, midY - 15);
+        }
+        ctx.restore();
     };
 
     useEffect(() => {
@@ -224,11 +303,18 @@ const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({ knobs }) => {
         
         const draw = () => {
             if (!canvasRef.current) return;
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            const dpr = window.devicePixelRatio || 1;
+            const width = canvas.clientWidth;
+            const height = canvas.clientHeight;
+
+            ctx.clearRect(0, 0, width * dpr, height * dpr);
+            ctx.save();
+            ctx.scale(dpr,dpr);
+
             const scheme = colorSchemes[colorScheme as keyof typeof colorSchemes];
             
             gridOffset.current = (gridOffset.current + 0.2) % 500;
-            drawGrid(ctx, canvas.clientWidth, canvas.clientHeight, scheme.grid);
+            drawGrid(ctx, width, height, scheme.grid);
 
             analyser.getByteTimeDomainData(dataArray);
 
@@ -243,50 +329,36 @@ const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({ knobs }) => {
 
             ctx.fillStyle = scheme.particle;
             particlesRef.current.forEach(p => {
-                // Interactive Gravity Well & Swirl
                 if (mousePosition.current.x !== null && mousePosition.current.y !== null) {
                     const dx = mousePosition.current.x - p.x;
                     const dy = mousePosition.current.y - p.y;
                     const distance = Math.sqrt(dx * dx + dy * dy);
                     
                     if (distance > 1) {
-                        const forceMagnitude = 1 / Math.max(distance, 50); // Avoid extreme forces up close
-                        
-                        // Force towards the cursor (gravity)
+                        const forceMagnitude = 1 / Math.max(distance, 50);
                         const attractionForceX = dx * forceMagnitude * 0.15;
                         const attractionForceY = dy * forceMagnitude * 0.15;
-                        
-                        // Perpendicular force for swirling motion
                         const swirlForceX = -dy * forceMagnitude * 0.1;
                         const swirlForceY = dx * forceMagnitude * 0.1;
-
                         p.speedX += attractionForceX + swirlForceX;
                         p.speedY += attractionForceY + swirlForceY;
                     }
                 }
                 
-                // Apply friction
-                p.speedX *= 0.96; // Slightly less friction for more fluid motion
+                p.speedX *= 0.96;
                 p.speedY *= 0.96;
-
-                // Update position
                 p.x += p.speedX;
                 p.y += p.speedY;
 
-                // Screen wrapping
-                if (p.x > canvas.clientWidth + p.size) p.x = -p.size; else if (p.x < -p.size) p.x = canvas.clientWidth + p.size;
-                if (p.y > canvas.clientHeight + p.size) p.y = -p.size; else if (p.y < -p.size) p.y = canvas.clientHeight + p.size;
+                if (p.x > width + p.size) p.x = -p.size; else if (p.x < -p.size) p.x = width + p.size;
+                if (p.y > height + p.size) p.y = -p.size; else if (p.y < -p.size) p.y = height + p.size;
 
-                // Audio-reactive pulsing size
                 const targetSize = p.baseSize * sizeMultiplier;
-                p.size += (targetSize - p.size) * 0.1; // Smooth transition
-
-                // Draw particle
+                p.size += (targetSize - p.size) * 0.1;
                 ctx.beginPath();
                 ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
                 ctx.fill();
             });
-
 
             ctx.lineWidth = 2;
             ctx.strokeStyle = scheme.primary;
@@ -294,19 +366,21 @@ const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({ knobs }) => {
             ctx.shadowColor = scheme.shadow;
             ctx.beginPath();
             
-            const sliceWidth = canvas.clientWidth / bufferLength;
+            const sliceWidth = width / bufferLength;
             let x = 0;
             for (let i = 0; i < bufferLength; i++) {
                 const v = dataArray[i] / 128.0;
-                const y = v * (canvas.clientHeight / 2);
+                const y = v * (height / 2);
                 if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
                 x += sliceWidth;
             }
-            ctx.lineTo(canvas.clientWidth, canvas.clientHeight / 2);
+            ctx.lineTo(width, height / 2);
             ctx.stroke();
             ctx.shadowBlur = 0;
 
-            drawTouchFeedback(ctx, scheme);
+            drawInteractionFeedback(ctx, scheme, width, height);
+
+            ctx.restore();
 
             animationFrameId.current = requestAnimationFrame(draw);
         };
@@ -318,12 +392,12 @@ const VisualizerCanvas: React.FC<VisualizerCanvasProps> = ({ knobs }) => {
                 cancelAnimationFrame(animationFrameId.current);
             }
         };
-    }, [colorScheme, particleDensity, initParticles, knobs]);
+    }, [colorScheme, particleDensity, initParticles]);
 
 
     return (
         <div 
-            className="relative flex-grow bg-black/50 backdrop-blur-md border border-white/10 rounded-lg flex flex-col items-center justify-center space-y-6 overflow-hidden"
+            className="relative flex-grow bg-black/50 backdrop-blur-md border border-white/10 rounded-lg flex flex-col items-center justify-center space-y-6 overflow-hidden cursor-crosshair"
             style={{ touchAction: 'none' }}
         >
             <canvas ref={canvasRef} className="absolute top-0 left-0 w-full h-full z-0" />

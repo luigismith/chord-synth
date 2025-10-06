@@ -1,4 +1,5 @@
 
+
 import { GoogleGenAI, Type } from "@google/genai";
 import { Chord } from '../types';
 
@@ -22,7 +23,7 @@ export const generateChordProgression = async (key: string, scale: string): Prom
         ];
     }
   
-  const prompt = `Generate a 4-chord progression in the key of ${key} ${scale} suitable for a Synthwave or Retrowave track. The chords should be lush and atmospheric. Just provide the chord names.`;
+  const prompt = `Generate a 4-chord progression in the key of ${key} ${scale} suitable for a Synthwave or Retrowave track. The chords should be lush and atmospheric. Use common jazz-influenced voicings like maj7, m9, 7sus4, or altered dominants where appropriate. Just provide the chord names.`;
   
   try {
     const response = await ai.models.generateContent({
@@ -35,7 +36,7 @@ export const generateChordProgression = async (key: string, scale: string): Prom
           properties: {
             progression: {
               type: Type.ARRAY,
-              description: "An array of 4 chords.",
+              description: "An array of 4 chord names.",
               items: {
                 type: Type.OBJECT,
                 properties: {
@@ -73,4 +74,3 @@ export const generateChordProgression = async (key: string, scale: string): Prom
     ];
   }
 };
-   
