@@ -32,8 +32,6 @@ const App: React.FC = () => {
   const [arpPattern, setArpPattern] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [activeTransport, setActiveTransport] = useState<string | null>(null);
-  const [activeArpNote, setActiveArpNote] = useState<number | null>(null);
-
 
   // Preset Management State
   const [userPresets, setUserPresets] = useState<Preset[]>([]);
@@ -60,7 +58,6 @@ const App: React.FC = () => {
   const stopArp = useCallback(() => {
     if (arpTimeoutId.current) clearTimeout(arpTimeoutId.current);
     arpTimeoutId.current = null;
-    setActiveArpNote(null);
 
     const notesToStop = new Set<number>(sustainedNoteTimeouts.current.keys());
     if (lastArpNote.current !== null) {
@@ -104,7 +101,6 @@ const App: React.FC = () => {
       const timbreValue = knobs.find(k => k.id === 7)?.value ?? 0;
       audioService.playNote(noteToPlay, timbreValue);
       lastArpNote.current = noteToPlay;
-      setActiveArpNote(noteToPlay);
     }
     const density = knobs.find(k => k.id === 2)?.value ?? 50;
     const baseInterval = 600 - (density * 5.5);
@@ -370,7 +366,7 @@ const App: React.FC = () => {
           
           {/* CENTRAL VISUALIZER */}
           <div className="flex-grow flex flex-col gap-6 min-h-[400px] lg:min-h-0">
-              <VisualizerCanvas knobs={knobs} activeArpNote={activeArpNote} />
+              <VisualizerCanvas knobs={knobs} />
           </div>
 
           {/* RIGHT SYNTH CONTROLS */}
