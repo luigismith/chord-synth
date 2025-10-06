@@ -1,0 +1,5 @@
+{
+  "name": "Orchid Synth",
+  "description": "A Synthwave/Retrowave intelligent synthesizer inspired by Tame Impala's philosophy. It features a smart harmony engine, gestural controls, and deep integration with USB MIDI controllers like the Akai MPK Mini Plus to ensure every note played is musical and in key.",
+  "requestFramePermissions": []
+}
